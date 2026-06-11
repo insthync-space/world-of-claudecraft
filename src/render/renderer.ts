@@ -52,6 +52,9 @@ const ENV_INTENSITY = 0.5;
 // (env at 0.15 still lit rigs sky-blue against the pitch-dark crypt)
 const DUNGEON_SUN_INTENSITY = 0.3;
 const DUNGEON_ENV_INTENSITY = 0.05;
+// raw HDRI PMREMs integrate the real sun the dome shader clamps away —
+// rescale so ambient matches the dome-capture look (see lookdev-hookup.md)
+const IBL_RAW_SCALE = 0.55;
 const DUNGEON_HEMI_INTENSITY = 0.14;
 // character rim glow scales up underground so silhouettes split from the murk
 const DUNGEON_RIM_BOOST = 2.4;
@@ -121,6 +124,9 @@ export class Renderer {
   private lightRank: { light: THREE.PointLight; d2: number; worldPos: THREE.Vector3 }[] = [];
   private doomedIds: number[] = [];
   private dungeons: DungeonInteriors | null = null;
+  private envRTs = new Map<BiomeId, THREE.WebGLRenderTarget>();
+  private envBiome: BiomeId = 'vale';
+  private envOutdoorIntensity = ENV_INTENSITY;
   private time = 0;
   private frameIdx = 0;
   vfx: Vfx;
@@ -156,16 +162,30 @@ export class Renderer {
     this.sky = this.skyView.dome;
     this.scene.add(this.sky);
 
-    // IBL: prefilter the sky dome itself so PBR materials get sky-matched
-    // ambient specular/diffuse (low keeps the flat Lambert look instead)
+    // IBL: prefilter the real per-biome HDRI equirects so PBR materials get
+    // sky-matched ambient; swapped as the camera crosses biome bands (the
+    // dome shader cross-fades the same textures). The raw equirects carry
+    // the unclamped sun that the dome shader tames with per-biome gain, so
+    // the environment intensity is rescaled to match the shipped look.
     if (!LOW_GFX) {
       const pmrem = new THREE.PMREMGenerator(this.webgl);
-      const envScene = new THREE.Scene();
-      envScene.add(this.sky.clone());
-      const envRT = pmrem.fromScene(envScene, 0.04, 0.1, 1100); // far must cover the 560u dome
-      this.scene.environment = envRT.texture;
-      this.scene.environmentIntensity = ENV_INTENSITY;
-      pmrem.dispose();
+      for (const b of ['vale', 'marsh', 'peaks'] as BiomeId[]) {
+        const eq = this.skyView.envTexture(b);
+        if (eq) this.envRTs.set(b, pmrem.fromEquirectangular(eq));
+      }
+      if (this.envRTs.size > 0) {
+        this.envOutdoorIntensity = ENV_INTENSITY * IBL_RAW_SCALE;
+        this.scene.environment = this.envRTs.get('vale')!.texture;
+        this.scene.environmentRotation.y = this.skyView.envRotationY('vale');
+      } else {
+        // fallback: prefilter the dome itself (gain/clamp already applied)
+        const envScene = new THREE.Scene();
+        envScene.add(this.sky.clone());
+        const envRT = pmrem.fromScene(envScene, 0.04, 0.1, 1100); // far must cover the 560u dome
+        this.scene.environment = envRT.texture;
+      }
+      this.scene.environmentIntensity = this.envOutdoorIntensity;
+      pmrem.dispose(); // prefiltered envRTs stay alive for the session
     }
 
     const hemi = new THREE.HemisphereLight(0xcfe8ff, 0x46603a, LOW_GFX ? 1.0 : HEMI_INTENSITY);
@@ -601,7 +621,7 @@ export class Renderer {
         const underground = desired === 'dungeon';
         this.sun.intensity = underground ? DUNGEON_SUN_INTENSITY : SUN_INTENSITY;
         this.hemi.intensity = underground ? DUNGEON_HEMI_INTENSITY : HEMI_INTENSITY;
-        this.scene.environmentIntensity = underground ? DUNGEON_ENV_INTENSITY : ENV_INTENSITY;
+        this.scene.environmentIntensity = underground ? DUNGEON_ENV_INTENSITY : this.envOutdoorIntensity;
         sharedUniforms.uRimBoost.value = underground ? DUNGEON_RIM_BOOST : 1;
       }
       return;
@@ -614,6 +634,23 @@ export class Renderer {
       fog.near += (preset.near - fog.near) * k;
       fog.far += (preset.far - fog.far) * k;
     }
+  }
+
+  // Swap the prefiltered environment map to the dominant biome's HDRI as the
+  // camera crosses zone bands (the dome cross-fades the same textures); a
+  // brief intensity dip masks the hard texture swap, then eases back like fog.
+  private updateEnvBiome(dt: number): void {
+    if (this.lowGfx || this.envRTs.size < 2) return;
+    const blend = this.skyView.biomeAt(this.camera.position.z);
+    const dominant = blend.t < 0.5 ? blend.from : blend.to;
+    if (dominant !== this.envBiome && this.envRTs.has(dominant)) {
+      this.envBiome = dominant;
+      this.scene.environment = this.envRTs.get(dominant)!.texture;
+      this.scene.environmentRotation.y = this.skyView.envRotationY(dominant);
+      this.scene.environmentIntensity = this.envOutdoorIntensity * 0.4;
+    }
+    const k = 1 - Math.exp(-dt * 1.5);
+    this.scene.environmentIntensity += (this.envOutdoorIntensity - this.scene.environmentIntensity) * k;
   }
 
   // Drop the view of an entity that left the world / our interest area.
@@ -854,7 +891,10 @@ export class Renderer {
     // sky dome + sun disc ride along with the camera
     this.sky.position.set(this.camera.position.x, 0, this.camera.position.z);
     this.sky.visible = this.fogState === 'outdoor';
-    if (this.sky.visible) this.skyView.setCameraZ(this.camera.position.z, dt);
+    if (this.sky.visible) {
+      this.skyView.setCameraZ(this.camera.position.z, dt);
+      this.updateEnvBiome(dt);
+    }
     for (const sp of this.sunSprites) {
       sp.position.copy(this.camera.position).addScaledVector(this.sunDir, 760);
       sp.visible = this.fogState === 'outdoor';
