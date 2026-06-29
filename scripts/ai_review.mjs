@@ -19,6 +19,7 @@
 //   DIFF_FILE           path to a unified diff to review
 //   OPENROUTER_MODEL    model id (default openrouter/owl-alpha)
 //   MAX_DIFF_CHARS      cap on diff chars sent to the model (default 60000)
+import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import { upsertStickyComment } from './gh_sticky_comment.mjs';
 
@@ -54,19 +55,103 @@ if (diff.length > MAX_DIFF_CHARS) {
   truncated = true;
 }
 
-const system = [
-  'You are a concise senior code reviewer for World of ClaudeCraft, a TypeScript micro-MMO',
-  'and reinforcement-learning environment built on one deterministic 20 Hz simulation core.',
-  'Key invariants to watch for: src/sim/ must stay pure (no DOM/Three/render/ui/net imports);',
-  'all randomness goes through the Rng helper, never Math.random/Date.now/performance.now; the',
-  'server is authoritative and clients never decide outcomes; every player-visible string is a',
-  't() key; no em dashes, en dashes, or emojis anywhere.',
-  'Review ONLY the diff below. Be specific and brief. Group findings under: Correctness,',
-  'Invariants, Tests, Nits. Tag each finding with severity (high/medium/low). If the change',
-  'looks fine, say so in one line. Do not restate the diff. Output GitHub-flavored Markdown.',
-].join(' ');
+// Give the model the file list of the directories this diff touches, so it stops
+// hallucinating that existing imports/helpers are "missing" (its top false positive).
+// Best-effort: empty string when not in a git checkout.
+function listTouchedDirs(d) {
+  const files = [...d.matchAll(/^\+\+\+ b\/(.+)$/gm)]
+    .map((m) => m[1])
+    .filter((p) => p !== '/dev/null');
+  // Map each changed file to its parent dir; drop the repo root so a root-level file
+  // (e.g. .gitignore) does not expand `git ls-files` to the whole tree.
+  const dirs = [
+    ...new Set(
+      files
+        .map((f) => (f.includes('/') ? f.slice(0, f.lastIndexOf('/')) : '.'))
+        .filter((d) => d !== '.'),
+    ),
+  ];
+  if (!dirs.length) return '';
+  try {
+    const out = execSync(`git ls-files -- ${dirs.map((x) => `'${x}'`).join(' ')}`, {
+      encoding: 'utf8',
+      maxBuffer: 8 * 1024 * 1024,
+    }).trim();
+    // Safety cap so a large touched directory cannot blow up the prompt.
+    const lines = out.split('\n');
+    return lines.length > 500
+      ? `${lines.slice(0, 500).join('\n')}\n... (${lines.length - 500} more)`
+      : out;
+  } catch {
+    return '';
+  }
+}
+const repoFiles = listTouchedDirs(diff);
 
-const user = `${truncated ? `Note: the diff was truncated to the first ${MAX_DIFF_CHARS} characters.\n\n` : ''}Unified diff to review:\n\n\`\`\`diff\n${diff}\n\`\`\``;
+// Declared dependency names, so the model does not flag an imported package as "missing
+// from package.json" (a false positive it cannot otherwise verify from the diff).
+function declaredDeps() {
+  try {
+    const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+    return [...Object.keys(pkg.dependencies ?? {}), ...Object.keys(pkg.devDependencies ?? {})]
+      .sort()
+      .join(', ');
+  } catch {
+    return '';
+  }
+}
+const deps = declaredDeps();
+
+const system = `You are a precise, skeptical senior code reviewer for World of ClaudeCraft, a TypeScript
+micro-MMO and reinforcement-learning environment built on one deterministic 20 Hz simulation core.
+
+You see ONLY a unified diff plus a list of files that ALREADY EXIST in the repository. Everything
+not shown in the diff already exists and works. Do NOT flag an imported module, helper, or
+referenced file as "missing" or "not in the diff": that is expected. If an import resolves to a path
+in the existing-files list, it is fine. You are also given the list of declared package.json
+dependencies; an import of any listed package is available, so NEVER say a dependency is missing
+from package.json. When you cannot verify something from what you were given, ask a one-line
+question at LOW severity instead of asserting a problem.
+
+Invariant scope, apply LITERALLY and do not generalize beyond it: these rules constrain application
+code under src/ ONLY.
+- src/sim/ stays pure: no DOM/Three/render/ui/net imports; all randomness via the Rng helper, never
+  Math.random / Date.now / performance.now.
+- The server is authoritative; clients never decide outcomes.
+- Every player-visible string rendered by the app is a t() key.
+Code under scripts/, tests/, headless/, and CI YAML under .github/ is Node TOOLING: it is
+English-only, exempt from t(), and may use Math.random / Date.now / child_process freely. NEVER
+raise a t(), Rng, or sim-purity finding against a file outside src/. The "no em dashes, en dashes,
+or emojis" rule applies everywhere.
+
+Severity rubric, use it strictly:
+- high: a real bug, security issue, or src/ invariant violation that WILL break behavior or fail CI
+  AND that you can confirm from the diff alone.
+- medium: likely incorrect or risky, but not certain.
+- low: style, naming, maintainability, or a question.
+If you CANNOT verify a finding from the diff and the provided context, it is AT MOST low and MUST be
+phrased as a one-line question, never high or medium. Do not guess at repository state you were not
+given (CI pins, other files' contents): if you did not see it, do not assert it.
+
+Output rules: prefer FEW high-confidence findings over many. If you are not confident a finding is
+real, OMIT it. Do not pad with generic advice. Only mention missing tests when the diff changes src/
+or server logic that the repo actually tests. Do NOT add your own title or top-level heading (no
+"# ..." or "## AI review"); start directly with the first group. Group findings under Correctness,
+Invariants, Tests, Nits and tag each with its severity. If the change looks fine, say so in one line.
+Do not restate the diff. Output GitHub-flavored Markdown.`;
+
+const user = [
+  truncated ? `Note: the diff was truncated to the first ${MAX_DIFF_CHARS} characters.\n` : '',
+  repoFiles
+    ? `Files that already exist in the directories this diff touches (so you can resolve imports and must NOT flag these as missing):\n\n\`\`\`\n${repoFiles}\n\`\`\`\n`
+    : '',
+  deps
+    ? `Declared package.json dependencies (names only); any import of these is available, do NOT flag it as missing:\n\n${deps}\n`
+    : '',
+  `Unified diff to review:\n\n\`\`\`diff\n${diff}\n\`\`\``,
+]
+  .filter(Boolean)
+  .join('\n');
 
 async function review() {
   const res = await fetch(ENDPOINT, {
